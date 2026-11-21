@@ -1,0 +1,307 @@
+# Fork-only exploratory CI: configurations that upstream test.yaml does not cover.
+name: ci-extra
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'ci-extra', 'ci-extra-*' ]
+
+permissions:
+  contents: read
+
+env:
+  MIMALLOC_SHOW_ERRORS: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  edge:
+    name: edge, ${{ matrix.os }}, ${{ matrix.cfg }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+        cfg: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          extra=""; [ "${{ matrix.cfg }}" = Debug ] && extra="-DMI_DEBUG=FULL"
+          cmake -B out/b -DCMAKE_BUILD_TYPE=${{ matrix.cfg }} -DMI_BUILD_TESTS=OFF -DMI_BUILD_SHARED=OFF -DMI_BUILD_OBJECT=OFF -DMI_OVERRIDE=OFF $extra
+          cmake --build out/b --config ${{ matrix.cfg }} --parallel 4
+      - name: Edge tests
+        run: |
+          cat > out/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(edge C)
+          add_executable(edge ${SRC}/ci-extra/edge.c)
+          target_include_directories(edge PRIVATE ${SRC}/include)
+          file(GLOB_RECURSE MILIB "${LIBDIR}/*mimalloc*.lib" "${LIBDIR}/*mimalloc*.a")
+          list(GET MILIB 0 MILIB0)
+          message(STATUS "linking ${MILIB0}")
+          target_link_libraries(edge PRIVATE ${MILIB0})
+          if(WIN32)
+            target_link_libraries(edge PRIVATE advapi32 bcrypt psapi)
+          elseif(NOT APPLE)
+            target_link_libraries(edge PRIVATE pthread rt atomic)
+          endif()
+          EOF
+          cmake -S out -B out/e -DCMAKE_BUILD_TYPE=${{ matrix.cfg }} -DSRC="$PWD" -DLIBDIR="$PWD/out/b"
+          cmake --build out/e --config ${{ matrix.cfg }}
+          exe=$(find out/e -name 'edge' -type f -perm -u+x -o -name 'edge.exe' | head -1)
+          "$exe"
+
+  valgrind:
+    name: valgrind, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: Build
+        run: |
+          cmake -B out/vg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=ON -DMI_TRACK=VALGRIND
+          cmake --build out/vg --parallel 4
+      - name: Run tests under valgrind
+        run: |
+          cd out/vg
+          rc=0
+          for t in mimalloc-test-api mimalloc-test-api-fill; do
+            echo "::group::$t"; valgrind --error-exitcode=99 --track-origins=yes -q ./$t || { echo "::error::$t failed under valgrind"; rc=1; }; echo "::endgroup::"
+          done
+          echo "::group::stress"; valgrind --error-exitcode=99 -q ./mimalloc-test-stress 4 20 4 || { echo "::error::stress failed under valgrind"; rc=1; }; echo "::endgroup::"
+          exit $rc
+
+  msan:
+    name: msan, ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          CC=clang CXX=clang++ cmake -B out/msan -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_OVERRIDE=OFF -DMI_BUILD_SHARED=OFF \
+            -DCMAKE_C_FLAGS="-fsanitize=memory -fsanitize-memory-track-origins -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=memory"
+          cmake --build out/msan --parallel 4
+          MI_TEST_LIGHT=1 ctest --test-dir out/msan --output-on-failure --timeout 600 -E "dynamic|fork"
+
+  gcc-sanitizers:
+    name: gcc ${{ matrix.san }}, ubuntu-latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [address, undefined, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          case "${{ matrix.san }}" in
+            address)   args="-DMI_TRACK=ASAN";;
+            thread)    args="-DMI_DEBUG_TSAN=ON";;
+            undefined) args="-DCMAKE_C_FLAGS=-fsanitize=undefined -fno-sanitize-recover=all -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=undefined -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=undefined";;
+          esac
+          if [ "${{ matrix.san }}" = undefined ]; then
+            CC=gcc CXX=g++ cmake -B out/s -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined" -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=undefined" -DMI_OVERRIDE=OFF
+          else
+            CC=gcc CXX=g++ cmake -B out/s -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL $args
+          fi
+          cmake --build out/s --parallel 4
+          MI_TEST_LIGHT=1 ctest --test-dir out/s --output-on-failure --timeout 600
+
+  linux-i686:
+    name: linux-i686, ${{ matrix.cfg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q gcc-multilib g++-multilib
+      - name: Build and test
+        run: |
+          extra=""; [ "${{ matrix.cfg }}" = Debug ] && extra="-DMI_DEBUG=FULL"
+          cmake -B out/x86 -DCMAKE_BUILD_TYPE=${{ matrix.cfg }} -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32 -DCMAKE_SHARED_LINKER_FLAGS=-m32 -DMI_OPT_ARCH=OFF $extra
+          cmake --build out/x86 --parallel 4
+          ctest --test-dir out/x86 --output-on-failure --timeout 600
+          gcc -m32 -O1 -Iinclude ci-extra/edge.c -o out/edge32 $(find out/x86 -maxdepth 1 -name 'libmimalloc*.a' | head -1) -lpthread -latomic && out/edge32
+
+  qemu-bigendian:
+    name: qemu, ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: s390x
+            triple: s390x-linux-gnu
+          - arch: ppc64
+            triple: powerpc64-linux-gnu
+    env:
+      QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q gcc-${{ matrix.triple }} g++-${{ matrix.triple }} qemu-user
+      - name: Build and test
+        run: |
+          cmake -B out/be -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.arch }} \
+            -DCMAKE_C_COMPILER=${{ matrix.triple }}-gcc -DCMAKE_CXX_COMPILER=${{ matrix.triple }}-g++ -DCMAKE_CROSSCOMPILING_EMULATOR=qemu-${{ matrix.arch }} -DMI_BUILD_SHARED=OFF
+          cmake --build out/be --parallel 4
+          MI_TEST_LIGHT=1 ctest --test-dir out/be --output-on-failure --timeout 900 -E "fork|dynamic"
+          ${{ matrix.triple }}-gcc -O1 -Iinclude ci-extra/edge.c -o out/edge-be $(find out/be -maxdepth 1 -name 'libmimalloc*.a' | head -1) -lpthread -latomic && qemu-${{ matrix.arch }} out/edge-be
+
+  options:
+    name: options, ${{ matrix.os }}, ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        name: [purge-now, no-decommit, no-purge, eager-commit, commit-on-demand, no-arena, small-arena, reserve-limit, no-retain, reclaim-on-free, no-reclaim, thp-off, destroy-on-exit, stats-merge, vabits-40, arena-max-obj]
+        include:
+          - { name: purge-now,        env: "MIMALLOC_PURGE_DELAY=0" }
+          - { name: no-decommit,      env: "MIMALLOC_PURGE_DELAY=0 MIMALLOC_PURGE_DECOMMITS=0" }
+          - { name: no-purge,         env: "MIMALLOC_PURGE_DELAY=-1" }
+          - { name: eager-commit,     env: "MIMALLOC_ARENA_EAGER_COMMIT=1" }
+          - { name: commit-on-demand, env: "MIMALLOC_PAGE_COMMIT_ON_DEMAND=1 MIMALLOC_ARENA_EAGER_COMMIT=0" }
+          - { name: no-arena,         env: "MIMALLOC_DISALLOW_ARENA_ALLOC=1" }
+          - { name: small-arena,      env: "MIMALLOC_ARENA_RESERVE=4MiB" }
+          - { name: reserve-limit,    env: "MIMALLOC_RESERVE_OS_MEMORY=2GiB MIMALLOC_DISALLOW_OS_ALLOC=1" }
+          - { name: no-retain,        env: "MIMALLOC_PAGE_FULL_RETAIN=0 MIMALLOC_PURGE_DELAY=0" }
+          - { name: reclaim-on-free,  env: "MIMALLOC_PAGE_RECLAIM_ON_FREE=1" }
+          - { name: no-reclaim,       env: "MIMALLOC_PAGE_RECLAIM_ON_FREE=-1 MIMALLOC_PAGE_MAX_RECLAIM=0 MIMALLOC_PAGE_CROSS_THREAD_MAX_RECLAIM=0" }
+          - { name: thp-off,          env: "MIMALLOC_ALLOW_THP=0 MIMALLOC_ALLOW_LARGE_OS_PAGES=1" }
+          - { name: destroy-on-exit,  env: "MIMALLOC_DESTROY_ON_EXIT=1" }
+          - { name: stats-merge,      env: "MIMALLOC_STATS_MERGE_THRESHOLD=0 MIMALLOC_STATS_MERGE_ON_COLLECT=1 MIMALLOC_GENERIC_COLLECT=1 MIMALLOC_SHOW_STATS=1" }
+          - { name: vabits-40,        env: "MIMALLOC_MAX_VABITS=40" }
+          - { name: arena-max-obj,    env: "MIMALLOC_ARENA_MAX_OBJECT_SIZE=1024" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B out/dbg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL
+          cmake --build out/dbg --config Debug --parallel 4
+      - name: Test with ${{ matrix.env }}
+        run: |
+          for kv in ${{ matrix.env }}; do export "$kv"; done
+          export MIMALLOC_VERBOSE=1
+          MI_TEST_LIGHT=1 ctest --test-dir out/dbg -C Debug --output-on-failure --timeout 900 -E "rust" 2>&1 | tee ctest.log
+          grep -E "mimalloc: (error|assertion)" ctest.log | sort | uniq -c | head -50 || true
+          test ${PIPESTATUS[0]} -eq 0
+
+  bsd:
+    name: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: openbsd, version: '7.7', pkgs: 'sudo pkg_add -I cmake' }
+          - { os: netbsd,  version: '10.1', pkgs: 'sudo pkgin -y install cmake' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cross-platform-actions/action@v0.29.0
+        with:
+          operating_system: ${{ matrix.os }}
+          version: ${{ matrix.version }}
+          shell: bash
+          run: |
+            ${{ matrix.pkgs }}
+            cmake -B out/dbg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL && cmake --build out/dbg --parallel 2 && MI_TEST_LIGHT=1 ctest --test-dir out/dbg --output-on-failure --timeout 900 || echo "DEBUG FAILED"
+            cmake -B out/rel -DCMAKE_BUILD_TYPE=Release && cmake --build out/rel --parallel 2 && ctest --test-dir out/rel --output-on-failure --timeout 900 || echo "RELEASE FAILED"
+
+  wasi:
+    name: wasi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup wasi-sdk and wasmtime
+        run: |
+          curl -sSL -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
+          tar xzf wasi-sdk.tar.gz && mv wasi-sdk-25.0-x86_64-linux /opt/wasi-sdk
+          curl -sSL https://wasmtime.dev/install.sh | bash
+      - name: Build and run
+        run: |
+          W=/opt/wasi-sdk
+          $W/bin/clang --sysroot=$W/share/wasi-sysroot -O2 -Iinclude -Isrc src/static.c test/test-api.c -o out-test-api.wasm -Wl,-z,stack-size=1048576 2>&1 | tail -20
+          ~/.wasmtime/bin/wasmtime out-test-api.wasm
+          $W/bin/clang --sysroot=$W/share/wasi-sysroot -O2 -Iinclude -Isrc src/static.c ci-extra/edge.c -o out-edge.wasm
+          ~/.wasmtime/bin/wasmtime out-edge.wasm
+
+  msvc-asan:
+    name: msvc asan, windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          cmake -B out/asan -DMI_TRACK=ASAN -DMI_DEBUG=FULL -DMI_BUILD_SHARED=OFF -DMI_OVERRIDE=OFF
+          cmake --build out/asan --config Debug --parallel 4
+          MI_TEST_LIGHT=1 ctest --test-dir out/asan -C Debug --output-on-failure --timeout 900
+
+  macos-sanitizers:
+    name: macos ${{ matrix.san }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: [asan, ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: |
+          case "${{ matrix.san }}" in
+            asan)  args="-DMI_TRACK=ASAN";;
+            ubsan) args="-DMI_DEBUG_UBSAN=ON";;
+            tsan)  args="-DMI_DEBUG_TSAN=ON";;
+          esac
+          cmake -B out/s -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL $args
+          cmake --build out/s --parallel 4
+          MI_TEST_LIGHT=1 ctest --test-dir out/s --output-on-failure --timeout 900
+
+  preload:
+    name: preload real programs, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libpython3.12-testsuite
+      - name: Build
+        run: |
+          cmake -B out/dbg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=ON -DMI_BUILD_TESTS=OFF
+          cmake --build out/dbg --parallel 4
+          ls out/dbg/*.so
+      - name: Python test suite under LD_PRELOAD
+        run: |
+          lib=$(ls $PWD/out/dbg/libmimalloc-debug.so)
+          LD_PRELOAD=$lib MIMALLOC_SHOW_ERRORS=1 timeout 3000 python3 -m test -j4 -u-network,-gui,-audio,-cpu --timeout 600 -x test_gdb test_tools test_peg_generator test_concurrent_futures test_multiprocessing_fork test_multiprocessing_forkserver test_multiprocessing_spawn test_subprocess test_signal test_threading test_socket 2>&1 | tee py.log | tail -40 || true
+          echo "== mimalloc messages =="; grep -E "mimalloc: (error|warning|assertion)" py.log | sort | uniq -c | sort -rn | head -40 || true
+      - name: Build mimalloc with preloaded compiler toolchain
+        run: |
+          lib=$(ls $PWD/out/dbg/libmimalloc-debug.so)
+          LD_PRELOAD=$lib MIMALLOC_SHOW_ERRORS=1 cmake -B out/pre -DCMAKE_BUILD_TYPE=Release > pre.log 2>&1
+          LD_PRELOAD=$lib MIMALLOC_SHOW_ERRORS=1 cmake --build out/pre --parallel 4 >> pre.log 2>&1 || echo BUILD FAILED
+          LD_PRELOAD=$lib MIMALLOC_SHOW_ERRORS=1 git log --oneline -200 >/dev/null 2>>pre.log
+          grep -E "mimalloc: (error|warning|assertion)" pre.log | sort | uniq -c | head -40 || echo "no mimalloc messages"
+
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q clang-tools cppcheck
+      - name: gcc -fanalyzer
+        run: |
+          gcc -c -O1 -fanalyzer -Iinclude -Isrc src/static.c -o /dev/null 2>&1 | grep -E "warning:" | sort | uniq -c | sort -rn | head -60 || true
+      - name: scan-build
+        run: |
+          scan-build -o scan cmake -B out/scan -DCMAKE_BUILD_TYPE=Debug -DMI_BUILD_TESTS=OFF >/dev/null
+          scan-build -o scan --status-bugs cmake --build out/scan --parallel 4 2>&1 | grep -E "warning:|bugs found" | sort | uniq | head -60 || true
