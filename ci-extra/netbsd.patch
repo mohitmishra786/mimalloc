@@ -1,0 +1,11 @@
+--- a/src/prim/unix/prim.c
++++ b/src/prim/unix/prim.c
+@@ -684,6 +684,8 @@
+   }
+   #if defined(PROT_MAX)
+   protect_flags |= PROT_MAX(PROT_READ | PROT_WRITE); // BSD
++  #elif defined(PROT_MPROTECT)
++  protect_flags |= PROT_MPROTECT(PROT_READ | PROT_WRITE); // NetBSD (PaX MPROTECT)
+   #endif
+   // huge page allocation
+   #if MI_OS_HAS_HUGE_PAGES
