@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [dev3, dev3-pax-off, dev3-patched, v3.7.0, v3.0.10, dev2]
+        variant: [dev3, dev3-pax-off, dev3-patched]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,6 +37,9 @@ jobs:
             sysctl security.pax.mprotect.enabled security.pax.mprotect.global || true
             if [ "${{ matrix.variant }}" = dev3-pax-off ]; then sudo sysctl -w security.pax.mprotect.global=0; fi
             cmake -B out/dbg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL > /dev/null && cmake --build out/dbg --parallel 2 > build.log 2>&1 || { tail -30 build.log; echo "BUILD FAILED"; }
+            echo "=== gdb backtrace (debug test-api)"
+            gdb -q -batch -ex run -ex bt -ex 'info threads' out/dbg/mimalloc-test-api 2>&1 | grep -vE '^\[|^warning' | head -80 || true
+            echo "=== end gdb"
             MI_TEST_LIGHT=1 ctest --test-dir out/dbg --output-on-failure --timeout 900 2>&1 | tee ctest.log | tail -40
             grep -E "assertion|cannot commit|tests passed" ctest.log | sort | uniq -c | head
             cmake -B out/rel -DCMAKE_BUILD_TYPE=Release > /dev/null && cmake --build out/rel --parallel 2 > build2.log 2>&1 || { tail -30 build2.log; echo "BUILD FAILED"; }
