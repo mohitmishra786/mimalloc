@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [dev3, dev3-pax-off, dev3-patched]
+        variant: [v3.6.1, v3.6.1-pax-off, v3.5.4]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,7 +23,8 @@ jobs:
           git remote add up https://github.com/microsoft/mimalloc.git && git fetch -q up dev2 --tags
           case "${{ matrix.variant }}" in
             dev3-patched) patch -p1 < ci-extra/netbsd.patch ;;
-            v3.7.0|v3.0.10) git checkout -q ${{ matrix.variant }} -- src include CMakeLists.txt cmake test ;;
+            v3.7.0|v3.0.10|v3.6.1|v3.5.4) git checkout -q ${{ matrix.variant }} -- src include CMakeLists.txt cmake test ;;
+            v3.6.1-pax-off) git checkout -q v3.6.1 -- src include CMakeLists.txt cmake test ;;
             dev2) git checkout -q up/dev2 -- src include CMakeLists.txt cmake test ;;
           esac
           git diff --stat | tail -1
@@ -35,7 +36,7 @@ jobs:
           run: |
             sudo pkgin -y install cmake >/dev/null
             sysctl security.pax.mprotect.enabled security.pax.mprotect.global || true
-            if [ "${{ matrix.variant }}" = dev3-pax-off ]; then sudo sysctl -w security.pax.mprotect.global=0; fi
+            if [ "${{ matrix.variant }}" = dev3-pax-off ] || [ "${{ matrix.variant }}" = v3.6.1-pax-off ]; then sudo sysctl -w security.pax.mprotect.global=0; fi
             cmake -B out/dbg -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL > /dev/null && cmake --build out/dbg --parallel 2 > build.log 2>&1 || { tail -30 build.log; echo "BUILD FAILED"; }
             echo "=== gdb backtrace (debug test-api)"
             gdb -q -batch -ex run -ex bt -ex 'info threads' out/dbg/mimalloc-test-api 2>&1 | grep -vE '^\[|^warning' | head -80 || true
