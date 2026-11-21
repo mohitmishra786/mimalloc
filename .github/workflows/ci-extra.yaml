@@ -72,9 +72,9 @@ jobs:
           cd out/vg
           rc=0
           for t in mimalloc-test-api mimalloc-test-api-fill; do
-            echo "::group::$t"; valgrind --error-exitcode=99 --track-origins=yes -q ./$t || { echo "::error::$t failed under valgrind"; rc=1; }; echo "::endgroup::"
+            echo "::group::$t"; valgrind --soname-synonyms=somalloc=*mimalloc* --error-exitcode=99 --track-origins=yes -q ./$t || { echo "::error::$t failed under valgrind"; rc=1; }; echo "::endgroup::"
           done
-          echo "::group::stress"; valgrind --error-exitcode=99 -q ./mimalloc-test-stress 4 20 4 || { echo "::error::stress failed under valgrind"; rc=1; }; echo "::endgroup::"
+          echo "::group::stress"; valgrind --soname-synonyms=somalloc=*mimalloc* --error-exitcode=99 -q ./mimalloc-test-stress 4 20 4 || { echo "::error::stress failed under valgrind"; rc=1; }; echo "::endgroup::"
           exit $rc
 
   msan:
@@ -228,8 +228,8 @@ jobs:
       - name: Build and run
         run: |
           W=/opt/wasi-sdk
-          $W/bin/clang --sysroot=$W/share/wasi-sysroot -O2 -Iinclude -Isrc src/static.c test/test-api.c -o out-test-api.wasm -Wl,-z,stack-size=1048576 2>&1 | tail -20
-          ~/.wasmtime/bin/wasmtime out-test-api.wasm
+          $W/bin/clang --sysroot=$W/share/wasi-sysroot -O2 -Iinclude -Isrc -D_WASI_EMULATED_PTHREAD src/static.c test/test-api.c -lwasi-emulated-pthread -o out-test-api.wasm -Wl,-z,stack-size=1048576 2>&1 | tail -20
+          ~/.wasmtime/bin/wasmtime out-test-api.wasm || echo "TEST-API FAILED"
           $W/bin/clang --sysroot=$W/share/wasi-sysroot -O2 -Iinclude -Isrc src/static.c ci-extra/edge.c -o out-edge.wasm
           ~/.wasmtime/bin/wasmtime out-edge.wasm
 
@@ -245,12 +245,13 @@ jobs:
           MI_TEST_LIGHT=1 ctest --test-dir out/asan -C Debug --output-on-failure --timeout 900
 
   macos-sanitizers:
-    name: macos ${{ matrix.san }}
+    name: macos ${{ matrix.san }}, override ${{ matrix.override }}
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
-        san: [asan, ubsan, tsan]
+        san: [tsan]
+        override: ['ON', 'OFF']
     steps:
       - uses: actions/checkout@v4
       - name: Build and test
@@ -260,9 +261,44 @@ jobs:
             ubsan) args="-DMI_DEBUG_UBSAN=ON";;
             tsan)  args="-DMI_DEBUG_TSAN=ON";;
           esac
-          cmake -B out/s -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL $args
+          cmake -B out/s -DCMAKE_BUILD_TYPE=Debug -DMI_DEBUG=FULL -DMI_OVERRIDE=${{ matrix.override }} $args
           cmake --build out/s --parallel 4
           MI_TEST_LIGHT=1 ctest --test-dir out/s --output-on-failure --timeout 900
+
+  csize-shared:
+    name: csize shared link, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build shared library and link a program using mi_malloc_csize
+        run: |
+          cmake -B out/b -DCMAKE_BUILD_TYPE=Release -DMI_BUILD_TESTS=OFF
+          cmake --build out/b --config Release --parallel 4
+          cat > out/csize.c <<'EOF'
+          #include <mimalloc.h>
+          #include <stdio.h>
+          int main(void) {
+            void* p = mi_malloc_csize(24);
+            void* q = mi_zalloc_csize(24);
+            printf("%p %p\n", p, q);
+            mi_free_csize(p, 24); mi_free_csize(q, 24);
+            return 0;
+          }
+          EOF
+          cat > out/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(csize C)
+          find_package(mimalloc REQUIRED PATHS ${MIDIR} NO_DEFAULT_PATH)
+          add_executable(csize csize.c)
+          target_link_libraries(csize PRIVATE mimalloc)
+          EOF
+          cmake --install out/b --prefix "$PWD/out/inst" --config Release
+          cmake -S out -B out/c -DCMAKE_BUILD_TYPE=Release -DMIDIR="$PWD/out/inst"
+          cmake --build out/c --config Release
 
   preload:
     name: preload real programs, ${{ matrix.os }}

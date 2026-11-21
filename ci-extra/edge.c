@@ -94,7 +94,7 @@ int main(void) {
   for (size_t s = 0; s < (1u<<26); s = s*2+1) {
     void* q = mi_malloc(s); size_t g = mi_good_size(s); size_t u = mi_usable_size(q);
     if (q==NULL || u < s || g < s) { fails++; printf("FAIL size %zu good=%zu usable=%zu\n", s, g, u); }
-    if (q) memset(q, 0x5a, u);
+    if (q) { unsigned char* volatile qv = (unsigned char*)q; memset(qv, 0x5a, u); }  // hide alloc_size from fortify
     mi_free(q);
   }
   { mi_heap_t* h = mi_heap_new(); void* q = mi_heap_malloc(h, 100); CHECK("heap_contains", mi_heap_contains(h, q) && mi_heap_of(q)==h);
