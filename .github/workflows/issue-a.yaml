@@ -1,0 +1,59 @@
+# Fork-only: verify the csize shared-library link problem and the fix
+name: issue-a
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'issue-a-csize-export' ]
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  csize:
+    name: ${{ matrix.os }}, ${{ matrix.variant }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        variant: [dev3, fixed]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Select header
+        run: |
+          if [ "${{ matrix.variant }}" = dev3 ]; then git checkout HEAD~2 -- include/mimalloc.h; fi
+          grep -n "w[mz]alloc_small(" include/mimalloc.h | head -4
+      - name: Build and install mimalloc (shared)
+        run: |
+          cmake -S . -B out/b -DCMAKE_BUILD_TYPE=Release -DMI_BUILD_TESTS=OFF
+          cmake --build out/b --config Release --parallel 4
+          cmake --install out/b --prefix "$PWD/out/inst" --config Release > /dev/null
+      - name: Exported symbols
+        run: |
+          case "${{ runner.os }}" in
+            Linux)   nm -D --defined-only out/b/libmimalloc.so | grep -E 'w[mz]alloc_small' || echo "(none exported)";;
+            macOS)   nm -gU out/b/libmimalloc.dylib | grep -E 'w[mz]alloc_small' || echo "(none exported)";;
+            Windows) dll=$(find out/b -name 'mimalloc*.dll' | head -1); echo "$dll"; "$(dirname "$(which cl 2>/dev/null || echo /c)")"/dumpbin 2>/dev/null || true
+                     objdump -p "$dll" 2>/dev/null | grep -E 'w[mz]alloc_small' || echo "(none exported or objdump unavailable)";;
+          esac
+      - name: Link a program using the csize helpers against the shared library
+        run: |
+          mkdir -p out/app && cp ci-extra/csize.c out/app/
+          cat > out/app/CMakeLists.txt <<'EOF2'
+          cmake_minimum_required(VERSION 3.18)
+          project(csize C)
+          find_package(mimalloc REQUIRED)
+          add_executable(csize csize.c)
+          target_link_libraries(csize PRIVATE mimalloc)
+          EOF2
+          cmake -S out/app -B out/app/b -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/out/inst"
+          cmake --build out/app/b --config Release
+      - name: Run
+        run: |
+          if [ "${{ runner.os }}" = Windows ]; then cp $(find out/inst -name 'mimalloc*.dll') out/app/b/Release/; fi
+          if [ "${{ runner.os }}" = Linux ]; then export LD_LIBRARY_PATH="$PWD/out/inst/lib"; fi
+          if [ "${{ runner.os }}" = macOS ]; then export DYLD_LIBRARY_PATH="$PWD/out/inst/lib"; fi
+          exe=$(find out/app/b -name 'csize' -type f -o -name 'csize.exe' | head -1); "$exe"
