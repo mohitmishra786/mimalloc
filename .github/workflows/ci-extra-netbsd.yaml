@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [v3.6.1, v3.6.1-pax-off, v3.5.4]
+        variant: [dev3, dev3-fixed]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,6 +23,7 @@ jobs:
           git remote add up https://github.com/microsoft/mimalloc.git && git fetch -q up dev2 --tags
           case "${{ matrix.variant }}" in
             dev3-patched) patch -p1 < ci-extra/netbsd.patch ;;
+            dev3-fixed) patch -p1 < ci-extra/netbsd-fix.patch ;;
             v3.7.0|v3.0.10|v3.6.1|v3.5.4) git checkout -q ${{ matrix.variant }} -- src include CMakeLists.txt cmake test ;;
             v3.6.1-pax-off) git checkout -q v3.6.1 -- src include CMakeLists.txt cmake test ;;
             dev2) git checkout -q up/dev2 -- src include CMakeLists.txt cmake test ;;
